@@ -30,6 +30,9 @@ env:
   NEXT_PUBLIC_VERCEL_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.target_environment || 'production' }}
   VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
   VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  # 部署后保留的生产部署数量（含刚部署的这一个，另一个作为回滚位）。
+  # 单个部署约 1.5GB（静态产物 + 函数包），保留 2 个约 3GB，远离 Hobby 的 10GB 上限。
+  KEEP_DEPLOYMENTS: '2'
 
 jobs:
   deploy:
@@ -138,6 +141,33 @@ jobs:
 
           deployment_url="$(echo "$deployment_output" | awk 'NF { line=$0 } END { print line }')"
           echo "url=$deployment_url" >> "$GITHUB_OUTPUT"
+
+      # Vercel Hobby 默认保留"最近 3 个生产部署 + 3 个任意部署"，不主动清理时
+      # 存储会长期停在 ~9GB。这里只保留最新 KEEP_DEPLOYMENTS 个，其余按创建时间从旧到新删除。
+      # 清理失败（权限/网络/部署正在被 alias）只记录日志，不阻断部署结果。
+      - name: Prune old production deployments
+        if: env.TARGET_ENVIRONMENT == 'production'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          response="$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_ORG_ID}&target=production&state=READY&limit=100")"
+
+          old="$(echo "$response" | jq -r --argjson keep "$KEEP_DEPLOYMENTS" \
+            '.deployments | sort_by(-.createdAt) | .[$keep:][] | "\(.uid) \(.url)"' 2>/dev/null)"
+
+          if [ -z "$old" ]; then
+            echo "[prune] nothing to prune (kept ${KEEP_DEPLOYMENTS}) or unexpected API response:"
+            echo "$response" | head -c 500 || true
+            exit 0
+          fi
+
+          while read -r id url; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v13/deployments/$id?teamId=${VERCEL_ORG_ID}")"
+            echo "[prune] DELETE $url -> HTTP $code"
+          done <<< "$old"
 
       - name: Write deployment summary
         run: |
